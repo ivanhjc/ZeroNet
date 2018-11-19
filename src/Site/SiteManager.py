@@ -46,7 +46,7 @@ class SiteManager(object):
                     self.sites[address] = site
                     self.log.debug("Loaded site %s in %.3fs" % (address, time.time() - s))
                     added += 1
-                elif startup and settings.get("peers", 0) > 0:
+                elif startup:
                     # No site directory, start download
                     self.log.debug("Found new site in sites.json: %s" % address)
                     gevent.spawn(self.need, address, settings=settings)
@@ -128,7 +128,7 @@ class SiteManager(object):
     # Return: Site object or None if not found
     def get(self, address):
         if not self.loaded:  # Not loaded yet
-            self.log.debug("Getting new site: %s)..." % address)
+            self.log.debug("Loading site: %s)..." % address)
             self.load()
         return self.sites.get(address)
 
@@ -146,6 +146,7 @@ class SiteManager(object):
             if not self.isAddress(address):
                 return False  # Not address: %s % address
             self.log.debug("Added new site: %s" % address)
+            config.loadTrackersFile()
             site = Site(address, settings=settings)
             self.sites[address] = site
             if not site.settings["serving"]:  # Maybe it was deleted before

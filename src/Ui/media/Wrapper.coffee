@@ -19,6 +19,7 @@ class Wrapper
 		@next_cmd_message_id = -1
 
 		@site_info = null # Hold latest site info
+		@server_info = null # Hold latest server info
 		@event_site_info =  $.Deferred() # Event when site_info received
 		@inner_loaded = false # If iframe loaded or not
 		@inner_ready = false # Inner frame ready to receive messages
@@ -26,8 +27,9 @@ class Wrapper
 		@site_error = null # Latest failed file download
 		@address = null
 		@opener_tested = false
+		@announcer_line = null
 
-		@allowed_event_constructors = [MouseEvent, KeyboardEvent] # Allowed event constructors
+		@allowed_event_constructors = [window.MouseEvent, window.KeyboardEvent, window.PointerEvent] # Allowed event constructors
 
 		window.onload = @onPageLoad # On iframe loaded
 		window.onhashchange = (e) => # On hash change
@@ -47,7 +49,7 @@ class Wrapper
 			throw "Event not trusted"
 
 		if e.originalEvent.constructor not in @allowed_event_constructors
-			throw "Invalid event constructor: #{e.constructor} != #{allowed_event_constructor}"
+			throw "Invalid event constructor: #{e.constructor} not in #{JSON.stringify(@allowed_event_constructors)}"
 
 		if e.originalEvent.currentTarget != allowed_target[0]
 			throw "Invalid event target: #{e.originalEvent.currentTarget} != #{allowed_target[0]}"
@@ -79,6 +81,11 @@ class Wrapper
 			@sendInner message # Pass to inner frame
 			if message.params.address == @address # Current page
 				@setSiteInfo message.params
+			@updateProgress message.params
+		else if cmd == "setAnnouncerInfo"
+			@sendInner message # Pass to inner frame
+			if message.params.address == @address # Current page
+				@setAnnouncerInfo message.params
 			@updateProgress message.params
 		else if cmd == "error"
 			@notifications.add("notification-#{message.id}", "error", message.params, 0)
@@ -210,20 +217,9 @@ class Wrapper
 			w.location = params[0]
 
 	actionRequestFullscreen: ->
-		if "Fullscreen" in @site_info.settings.permissions
-			elem = document.getElementById("inner-iframe")
-			request_fullscreen = elem.requestFullScreen || elem.webkitRequestFullscreen || elem.mozRequestFullScreen || elem.msRequestFullScreen
-			request_fullscreen.call(elem)
-			setTimeout ( =>
-				if window.innerHeight != screen.height  # Fullscreen failed, probably only allowed on click
-					@displayConfirm "This site requests permission:" + " <b>Fullscreen</b>", "Grant", =>
-						request_fullscreen.call(elem)
-			), 100
-		else
-			@displayConfirm "This site requests permission:" + " <b>Fullscreen</b>", "Grant", =>
-				@site_info.settings.permissions.push("Fullscreen")
-				@actionRequestFullscreen()
-				@ws.cmd "permissionAdd", "Fullscreen"
+		elem = document.getElementById("inner-iframe")
+		request_fullscreen = elem.requestFullScreen || elem.webkitRequestFullscreen || elem.mozRequestFullScreen || elem.msRequestFullScreen
+		request_fullscreen.call(elem)
 
 	actionPermissionAdd: (message) ->
 		permission = message.params
@@ -392,10 +388,20 @@ class Wrapper
 
 
 	onOpenWebsocket: (e) =>
-		@ws.cmd "channelJoin", {"channels": ["siteChanged", "serverChanged"]} # Get info on modifications
+		if window.show_loadingscreen   # Get info on modifications
+			@ws.cmd "channelJoin", {"channels": ["siteChanged", "serverChanged", "announcerChanged"]}
+		else
+			@ws.cmd "channelJoin", {"channels": ["siteChanged", "serverChanged"]}
 		if not @wrapperWsInited and @inner_ready
 			@sendInner {"cmd": "wrapperOpenedWebsocket"} # Send to inner frame
 			@wrapperWsInited = true
+		if window.show_loadingscreen
+			@ws.cmd "serverInfo", [], (server_info) =>
+				@server_info = server_info
+
+			@ws.cmd "announcerInfo", [], (announcer_info) =>
+				@setAnnouncerInfo(announcer_info)
+
 		if @inner_loaded # Update site info
 			@reloadSiteInfo()
 
@@ -433,7 +439,6 @@ class Wrapper
 			window.document.title = @site_info.content.title+" - ZeroNet"
 			@log "Setting title to", window.document.title
 
-
 	onWrapperLoad: =>
 		# Cleanup secret variables
 		delete window.wrapper
@@ -465,8 +470,8 @@ class Wrapper
 							if res == "ok"
 								@notifications.add("size_limit", "done", "Site storage limit modified!", 5000)
 
-			if site_info.content
-				window.document.title = site_info.content.title+" - ZeroNet"
+			if site_info.content?.title?
+				window.document.title = site_info.content.title + " - ZeroNet"
 				@log "Setting title to", window.document.title
 
 
@@ -520,6 +525,20 @@ class Wrapper
 		@site_info = site_info
 		@event_site_info.resolve()
 
+	setAnnouncerInfo: (announcer_info) ->
+		status_db = {announcing: [], error: [], announced: []}
+		for key, val of announcer_info.stats
+			if val.status
+				status_db[val.status].push(val)
+		status_line = "Trackers announcing: #{status_db.announcing.length}, error: #{status_db.error.length}, done: #{status_db.announced.length}"
+		if @announcer_line
+			@announcer_line.text(status_line)
+		else
+			@announcer_line = @loading.printLine(status_line)
+
+		if status_db.error.length > (status_db.announced.length + status_db.announcing.length)
+			@loading.showTrackerTorBridge(@server_info)
+
 	updateProgress: (site_info) ->
 		if site_info.tasks > 0 and site_info.started_task_num > 0
 			@loading.setProgress 1-(Math.max(site_info.tasks, site_info.bad_files) / site_info.started_task_num)
@@ -545,11 +564,15 @@ class Wrapper
 				return false
 			@loading.printLine res
 			@inner_loaded = false # Inner frame not loaded, just a 404 page displayed
-			if reload
-				src = $("iframe").attr("src")
-				$("iframe").attr "src", ""
-				$("iframe").attr "src", src
+			if reload then @reloadIframe()
 		return false
+
+	reloadIframe: =>
+		src = $("iframe").attr("src")
+		@ws.cmd "serverGetWrapperNonce", [], (wrapper_nonce) =>
+			src = src.replace(/wrapper_nonce=[A-Za-z0-9]+/, "wrapper_nonce=" + wrapper_nonce)
+			@log "Reloading iframe using url", src
+			$("iframe").attr "src", src
 
 	log: (args...) ->
 		console.log "[Wrapper]", args...

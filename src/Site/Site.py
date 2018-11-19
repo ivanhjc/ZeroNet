@@ -1,15 +1,10 @@
 import os
 import json
 import logging
-import hashlib
 import re
 import time
 import random
 import sys
-import struct
-import socket
-import urllib
-import urllib2
 import hashlib
 import collections
 
@@ -17,8 +12,6 @@ import gevent
 import gevent.pool
 
 import util
-from lib import bencode
-from lib.subtl.subtl import UdpTrackerClient
 from Config import config
 from Peer import Peer
 from Worker import WorkerManager
@@ -29,6 +22,8 @@ from Crypt import CryptHash
 from util import helper
 from util import Diff
 from Plugin import PluginManager
+from File import FileServer
+from SiteAnnouncer import SiteAnnouncer
 import SiteManager
 
 
@@ -46,8 +41,6 @@ class Site(object):
         self.peers = {}  # Key: ip:port, Value: Peer.Peer
         self.peers_recent = collections.deque(maxlen=100)
         self.peer_blacklist = SiteManager.peer_blacklist  # Ignore this peers (eg. myself)
-        self.time_announce = 0  # Last announce time to tracker
-        self.last_tracker_id = random.randint(0, 10)  # Last announced tracker id
         self.worker_manager = WorkerManager(self)  # Handle site download from other peers
         self.bad_files = {}  # SHA check failed files, need to redownload {"inner.content": 1} (key: file, value: failed accept)
         self.content_updated = None  # Content.js update time
@@ -63,7 +56,11 @@ class Site(object):
         if "main" in sys.modules and "file_server" in dir(sys.modules["main"]):  # Use global file server by default if possible
             self.connection_server = sys.modules["main"].file_server
         else:
-            self.connection_server = None
+            self.log.debug("Creating connection server")   # remove
+            self.connection_server = FileServer()
+
+        self.announcer = SiteAnnouncer(self)  # Announce and get peer list from other nodes
+
         if not self.settings.get("auth_key"):  # To auth user in site (Obsolete, will be removed)
             self.settings["auth_key"] = CryptHash.random()
             self.log.debug("New auth key: %s" % self.settings["auth_key"])
@@ -101,7 +98,7 @@ class Site(object):
                 self.bad_files[inner_path] = min(self.bad_files[inner_path], 20)
         else:
             self.settings = {
-                "own": False, "serving": True, "permissions": [],
+                "own": False, "serving": True, "permissions": [], "cache": {"bad_files": {}}, "size_files_optional": 0,
                 "added": int(time.time()), "optional_downloaded": 0, "size_optional": 0
             }  # Default
             if config.download_optional == "auto":
@@ -320,24 +317,38 @@ class Site(object):
         return valid
 
     def pooledDownloadContent(self, inner_paths, pool_size=100, only_if_bad=False):
-        self.log.debug("New downloadContent pool: len: %s" % len(inner_paths))
+        self.log.debug("New downloadContent pool: len: %s, only if bad: %s" % (len(inner_paths), only_if_bad))
         self.worker_manager.started_task_num += len(inner_paths)
         pool = gevent.pool.Pool(pool_size)
+        num_skipped = 0
+        site_size_limit = self.getSizeLimit() * 1024 * 1024
         for inner_path in inner_paths:
             if not only_if_bad or inner_path in self.bad_files:
                 pool.spawn(self.downloadContent, inner_path)
+            else:
+                num_skipped += 1
             self.worker_manager.started_task_num -= 1
-        self.log.debug("Ended downloadContent pool len: %s" % len(inner_paths))
+            if self.settings["size"] > site_size_limit * 0.95:
+                self.log.warning("Site size limit almost reached, aborting downloadContent pool")
+                for aborted_inner_path in inner_paths:
+                    if aborted_inner_path in self.bad_files:
+                        del self.bad_files[aborted_inner_path]
+                self.worker_manager.removeSolvedFileTasks(mark_as_good=False)
+                break
+        self.log.debug("Ended downloadContent pool len: %s, skipped: %s" % (len(inner_paths), num_skipped))
 
     def pooledDownloadFile(self, inner_paths, pool_size=100, only_if_bad=False):
-        self.log.debug("New downloadFile pool: len: %s" % len(inner_paths))
+        self.log.debug("New downloadFile pool: len: %s, only if bad: %s" % (len(inner_paths), only_if_bad))
         self.worker_manager.started_task_num += len(inner_paths)
         pool = gevent.pool.Pool(pool_size)
+        num_skipped = 0
         for inner_path in inner_paths:
             if not only_if_bad or inner_path in self.bad_files:
                 pool.spawn(self.needFile, inner_path, update=True)
+            else:
+                num_skipped += 1
             self.worker_manager.started_task_num -= 1
-        self.log.debug("Ended downloadFile pool len: %s" % len(inner_paths))
+        self.log.debug("Ended downloadFile pool len: %s, skipped: %s" % (len(inner_paths), num_skipped))
 
     # Update worker, try to find client that supports listModifications command
     def updater(self, peers_try, queried, since):
@@ -372,7 +383,7 @@ class Site(object):
             if modified_contents:
                 self.log.debug("%s new modified file from %s" % (len(modified_contents), peer))
                 modified_contents.sort(key=lambda inner_path: 0 - res["modified_files"][inner_path])  # Download newest first
-                gevent.spawn(self.pooledDownloadContent, modified_contents)
+                gevent.spawn(self.pooledDownloadContent, modified_contents, only_if_bad=True)
 
     # Check modified content.json files from peers and add modified files to bad_files
     # Return: Successfully queried peers [Peer, Peer...]
@@ -418,7 +429,7 @@ class Site(object):
                 if queried:
                     break
 
-        self.log.debug("Queried listModifications from: %s in %.3fs" % (queried, time.time() - s))
+        self.log.debug("Queried listModifications from: %s in %.3fs since %s" % (queried, time.time() - s, since))
         time.sleep(0.1)
         return queried
 
@@ -434,7 +445,7 @@ class Site(object):
         self.checkBadFiles()
 
         if announce:
-            self.announce()
+            self.announce(force=True)
 
         # Full update, we can reset bad files
         if check_files and since == 0:
@@ -475,20 +486,6 @@ class Site(object):
         file_size = self.storage.getSize(inner_path)
         content_json_modified = self.content_manager.contents[inner_path]["modified"]
         body = self.storage.read(inner_path)
-
-        # Find out my ip and port
-        tor_manager = self.connection_server.tor_manager
-        if tor_manager and tor_manager.enabled and tor_manager.start_onions:
-            my_ip = tor_manager.getOnion(self.address)
-            if my_ip:
-                my_ip += ".onion"
-            my_port = config.fileserver_port
-        else:
-            my_ip = config.ip_external
-            if self.connection_server.port_opened:
-                my_port = config.fileserver_port
-            else:
-                my_port = 0
 
         while 1:
             if not peers or len(published) >= limit:
@@ -580,7 +577,7 @@ class Site(object):
 
         # Publish more peers in the backgroup
         self.log.info(
-            "Successfuly %s published to %s peers, publishing to %s more peers in the background" %
+            "Published %s to %s peers, publishing to %s more peers in the background" %
             (inner_path, len(published), limit)
         )
 
@@ -684,13 +681,13 @@ class Site(object):
                             delete_removed_files=False, load_includes=False
                         )
                         if privatekey:
-                            new_site.content_manager.sign(file_inner_path.replace("-default", ""), privatekey)
+                            new_site.content_manager.sign(file_inner_path.replace("-default", ""), privatekey, remove_missing_optional=True)
                             new_site.content_manager.loadContent(
                                 file_inner_path, add_bad_files=False, delete_removed_files=False, load_includes=False
                             )
 
         if privatekey:
-            new_site.content_manager.sign("content.json", privatekey)
+            new_site.content_manager.sign("content.json", privatekey, remove_missing_optional=True)
             new_site.content_manager.loadContent(
                 "content.json", add_bad_files=False, delete_removed_files=False, load_includes=False
             )
@@ -774,6 +771,7 @@ class Site(object):
     def addPeer(self, ip, port, return_peer=False, connection=None, source="other"):
         if not ip or ip == "0.0.0.0":
             return False
+
         key = "%s:%s" % (ip, port)
         peer = self.peers.get(key)
         if peer:  # Already has this ip
@@ -790,206 +788,16 @@ class Site(object):
             peer.found(source)
             return peer
 
-    # Gather peer from connected peers
-    @util.Noparallel(blocking=False)
-    def announcePex(self, query_num=2, need_num=5):
-        peers = [peer for peer in self.peers.values() if peer.connection and peer.connection.connected]  # Connected peers
-        if len(peers) == 0:  # Small number of connected peers for this site, connect to any
-            self.log.debug("Small number of peers detected...query all of peers using pex")
-            peers = self.peers.values()
-            need_num = 10
-
-        random.shuffle(peers)
-        done = 0
-        added = 0
-        for peer in peers:
-            res = peer.pex(need_num=need_num)
-            if type(res) == int:  # We have result
-                done += 1
-                added += res
-                if res:
-                    self.worker_manager.onPeers()
-                    self.updateWebsocket(peers_added=res)
-            if done == query_num:
-                break
-        self.log.debug("Pex result: from %s peers got %s new peers." % (done, added))
-
-    # Gather peers from tracker
-    # Return: Complete time or False on error
-    def announceTracker(self, tracker_protocol, tracker_address, fileserver_port=0, add_types=[], my_peer_id="", mode="start"):
-        s = time.time()
-        if mode == "update":
-            num_want = 10
-        else:
-            num_want = 30
-
-        if "ip4" not in add_types:
-            fileserver_port = 0
-
-        if tracker_protocol == "udp":  # Udp tracker
-            if config.disable_udp:
-                return False  # No udp supported
-            ip, port = tracker_address.split(":")
-            tracker = UdpTrackerClient(ip, int(port))
-            tracker.peer_port = fileserver_port
-            try:
-                tracker.connect()
-                tracker.poll_once()
-                tracker.announce(info_hash=hashlib.sha1(self.address).hexdigest(), num_want=num_want, left=431102370)
-                back = tracker.poll_once()
-                if back and type(back) is dict:
-                    peers = back["response"]["peers"]
-                else:
-                    raise Exception("No response")
-            except Exception, err:
-                self.log.warning("Tracker error: udp://%s:%s (%s)" % (ip, port, err))
-                return False
-
-        elif tracker_protocol == "http":  # Http tracker
-            params = {
-                'info_hash': hashlib.sha1(self.address).digest(),
-                'peer_id': my_peer_id, 'port': fileserver_port,
-                'uploaded': 0, 'downloaded': 0, 'left': 431102370, 'compact': 1, 'numwant': num_want,
-                'event': 'started'
-            }
-            req = None
-            try:
-                url = "http://" + tracker_address + "?" + urllib.urlencode(params)
-                # Load url
-                with gevent.Timeout(30, False):  # Make sure of timeout
-                    req = urllib2.urlopen(url, timeout=25)
-                    response = req.read()
-                    req.fp._sock.recv = None  # Hacky avoidance of memory leak for older python versions
-                    req.close()
-                    req = None
-                if not response:
-                    self.log.warning("Tracker error: http://%s (No response)" % tracker_address)
-                    return False
-                # Decode peers
-                peer_data = bencode.decode(response)["peers"]
-                response = None
-                peer_count = len(peer_data) / 6
-                peers = []
-                for peer_offset in xrange(peer_count):
-                    off = 6 * peer_offset
-                    peer = peer_data[off:off + 6]
-                    addr, port = struct.unpack('!LH', peer)
-                    peers.append({"addr": socket.inet_ntoa(struct.pack('!L', addr)), "port": port})
-            except Exception, err:
-                self.log.warning("Tracker error: http://%s (%s)" % (tracker_address, err))
-                if req:
-                    req.close()
-                    req = None
-                return False
-        else:
-            peers = []
-
-        # Adding peers
-        added = 0
-        for peer in peers:
-            if peer["port"] == 1:  # Some trackers does not accept port 0, so we send port 1 as not-connectable
-                peer["port"] = 0
-            if not peer["port"]:
-                continue  # Dont add peers with port 0
-            if self.addPeer(peer["addr"], peer["port"], source="tracker"):
-                added += 1
-        if added:
-            self.worker_manager.onPeers()
-            self.updateWebsocket(peers_added=added)
-            self.log.debug(
-                "Tracker result: %s://%s (found %s peers, new: %s, total: %s)" %
-                (tracker_protocol, tracker_address, len(peers), added, len(self.peers))
-            )
-        return time.time() - s
-
-    # Add myself and get other peers from tracker
-    def announce(self, force=False, mode="start", pex=True):
-        if time.time() < self.time_announce + 30 and not force:
-            return  # No reannouncing within 30 secs
-        self.time_announce = time.time()
-
-        trackers = config.trackers
-        # Filter trackers based on supported networks
-        if config.disable_udp:
-            trackers = [tracker for tracker in trackers if not tracker.startswith("udp://")]
-        if self.connection_server and self.connection_server.tor_manager and not self.connection_server.tor_manager.enabled:
-            trackers = [tracker for tracker in trackers if ".onion" not in tracker]
-
-        if trackers and (mode == "update" or mode == "more"):  # Only announce on one tracker, increment the queried tracker id
-            self.last_tracker_id += 1
-            self.last_tracker_id = self.last_tracker_id % len(trackers)
-            trackers = [trackers[self.last_tracker_id]]  # We only going to use this one
-
-        errors = []
-        slow = []
-        add_types = []
-        if self.connection_server:
-            my_peer_id = self.connection_server.peer_id
-
-            # Type of addresses they can reach me
-            if self.connection_server.port_opened:
-                add_types.append("ip4")
-            if self.connection_server.tor_manager and self.connection_server.tor_manager.start_onions:
-                add_types.append("onion")
-        else:
-            my_peer_id = ""
-
-        s = time.time()
-        announced = 0
-        threads = []
-        fileserver_port = config.fileserver_port
-
-        for tracker in trackers:  # Start announce threads
-            tracker_protocol, tracker_address = tracker.split("://")
-            thread = gevent.spawn(
-                self.announceTracker, tracker_protocol, tracker_address, fileserver_port, add_types, my_peer_id, mode
-            )
-            threads.append(thread)
-            thread.tracker_address = tracker_address
-            thread.tracker_protocol = tracker_protocol
-
-        gevent.joinall(threads, timeout=10)  # Wait for announce finish
-
-        for thread in threads:
-            if thread.value:
-                if thread.value > 1:
-                    slow.append("%.2fs %s://%s" % (thread.value, thread.tracker_protocol, thread.tracker_address))
-                announced += 1
-            else:
-                if thread.ready():
-                    errors.append("%s://%s" % (thread.tracker_protocol, thread.tracker_address))
-                else:  # Still running
-                    slow.append("10s+ %s://%s" % (thread.tracker_protocol, thread.tracker_address))
-
-        # Save peers num
-        self.settings["peers"] = len(self.peers)
-
-        if len(errors) < len(threads):  # Less errors than total tracker nums
-            if announced == 1:
-                announced_to = trackers[0]
-            else:
-                announced_to = "%s trackers" % announced
-            if config.verbose:
-                self.log.debug(
-                    "Announced types %s in mode %s to %s in %.3fs, errors: %s, slow: %s" %
-                    (add_types, mode, announced_to, time.time() - s, errors, slow)
-                )
-        else:
-            if mode != "update":
-                self.log.error("Announce to %s trackers in %.3fs, failed" % (announced, time.time() - s))
-
-        if pex:
-            if not [peer for peer in self.peers.values() if peer.connection and peer.connection.connected]:
-                # If no connected peer yet then wait for connections
-                gevent.spawn_later(3, self.announcePex, need_num=10)  # Spawn 3 secs later
-            else:  # Else announce immediately
-                if mode == "more":  # Need more peers
-                    self.announcePex(need_num=10)
-                else:
-                    self.announcePex()
+    def announce(self, *args, **kwargs):
+        self.announcer.announce(*args, **kwargs)
 
     # Keep connections to get the updates
-    def needConnections(self, num=6, check_site_on_reconnect=False):
+    def needConnections(self, num=None, check_site_on_reconnect=False):
+        if num is None:
+            if len(self.peers) < 50:
+                num = 3
+            else:
+                num = 6
         need = min(len(self.peers), num, config.connected_limit)  # Need 5 peer, but max total peers
 
         connected = len(self.getConnectedPeers())
@@ -1037,7 +845,7 @@ class Site(object):
                 break  # Found requested number of peers
 
         if len(found) < need_num:  # Return not that good peers
-            found = [
+            found += [
                 peer for peer in peers
                 if not peer.key.endswith(":0") and
                 peer.key not in ignore and
@@ -1052,16 +860,19 @@ class Site(object):
         self.log.debug("Recent peers %s of %s (need: %s)" % (len(found), len(self.peers_recent), need_num))
 
         if len(found) >= need_num or len(found) >= len(self.peers):
-            return found[0:need_num]
+            return sorted(
+                found,
+                key=lambda peer: peer.reputation,
+                reverse=True
+            )[0:need_num]
 
         # Add random peers
         need_more = need_num - len(found)
         found_more = sorted(
             self.peers.values()[0:need_more * 50],
-            key=lambda peer: peer.time_found + peer.reputation * 60,
+            key=lambda peer: peer.reputation,
             reverse=True
         )[0:need_more * 2]
-        random.shuffle(found_more)
 
         found += found_more
 
@@ -1078,8 +889,11 @@ class Site(object):
                 continue
             peer = self.peers.get("%s:%s" % (connection.ip, connection.port))
             if peer:
-                if connection.target_onion and tor_manager.start_onions and tor_manager.getOnion(self.address) != connection.target_onion:
-                    continue
+                if connection.ip.endswith(".onion") and connection.target_onion and tor_manager.start_onions:
+                    # Check if the connection is made with the onion address created for the site
+                    valid_target_onions = (tor_manager.getOnion(self.address), tor_manager.getOnion("global"))
+                    if connection.target_onion not in valid_target_onions:
+                        continue
                 if not peer.connection:
                     peer.connect(connection)
                 back.append(peer)
@@ -1153,9 +967,10 @@ class Site(object):
     # Update hashfield
     def updateHashfield(self, limit=5):
         # Return if no optional files
-        if not self.content_manager.hashfield and not self.content_manager.contents.get("content.json", {}).get("files_optional"):
+        if not self.content_manager.hashfield and not self.content_manager.has_optional_files:
             return False
 
+        s = time.time()
         queried = 0
         connected_peers = self.getConnectedPeers()
         for peer in connected_peers:
@@ -1166,7 +981,7 @@ class Site(object):
             if queried >= limit:
                 break
         if queried:
-            self.log.debug("Queried hashfield from %s peers" % queried)
+            self.log.debug("Queried hashfield from %s peers in %.3fs" % (queried, time.time() - s))
         return queried
 
     # Returns if the optional file is need to be downloaded or not
@@ -1243,5 +1058,8 @@ class Site(object):
         self.updateWebsocket(file_failed=inner_path)
 
         if self.bad_files.get(inner_path, 0) > 30:
-            self.log.debug("Giving up on %s" % inner_path)
-            del self.bad_files[inner_path]  # Give up after 30 tries
+            self.fileForgot(inner_path)
+
+    def fileForgot(self, inner_path):
+        self.log.debug("Giving up on %s" % inner_path)
+        del self.bad_files[inner_path]  # Give up after 30 tries

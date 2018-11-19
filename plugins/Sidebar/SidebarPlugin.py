@@ -17,6 +17,7 @@ from Plugin import PluginManager
 from Debug import Debug
 from Translate import Translate
 from util import helper
+from ZipStream import ZipStream
 
 plugin_dir = "plugins/Sidebar"
 media_dir = plugin_dir + "/media"
@@ -62,6 +63,28 @@ class UiRequestPlugin(object):
             for part in super(UiRequestPlugin, self).actionUiMedia(path):
                 yield part
 
+    def actionZip(self):
+        address = self.get["address"]
+        site = self.server.site_manager.get(address)
+        if not site:
+            return self.error404("Site not found")
+
+        title = site.content_manager.contents.get("content.json", {}).get("title", "").encode('ascii', 'ignore')
+        filename = "%s-backup-%s.zip" % (title, time.strftime("%Y-%m-%d_%H_%M"))
+        self.sendHeader(content_type="application/zip", extra_headers={'Content-Disposition': 'attachment; filename="%s"' % filename})
+
+        return self.streamZip(site.storage.getPath("."))
+
+    def streamZip(self, file_path):
+        zs = ZipStream(file_path)
+        while 1:
+            data = zs.read()
+            if not data:
+                break
+            yield data
+
+
+
 
 @PluginManager.registerTo("UiWebsocket")
 class UiWebsocketPlugin(object):
@@ -92,9 +115,19 @@ class UiWebsocketPlugin(object):
         else:
             local_html = ""
 
+        peer_ips = [peer.key for peer in site.getConnectablePeers(20, allow_private=False)]
+        peer_ips.sort(key=lambda peer_ip: ".onion:" in peer_ip)
+        copy_link = "http://127.0.0.1:43110/%s/?zeronet_peers=%s" % (
+            site.content_manager.contents["content.json"].get("domain", site.address),
+            ",".join(peer_ips)
+        )
+
         body.append(_(u"""
             <li>
-             <label>{_[Peers]}</label>
+             <label>
+              {_[Peers]}
+              <small class="label-right"><a href='{copy_link}' id='link-copypeers' class='link-right'>{_[Copy to clipboard]}</a></small>
+             </label>
              <ul class='graph'>
               <li style='width: 100%' class='total back-black' title="{_[Total peers]}"></li>
               <li style='width: {percent_connectable:.0%}' class='connectable back-blue' title='{_[Connectable peers]}'></li>
@@ -137,7 +170,15 @@ class UiWebsocketPlugin(object):
         """))
 
     def sidebarRenderFileStats(self, body, site):
-        body.append(_(u"<li><label>{_[Files]}</label><ul class='graph graph-stacked'>"))
+        body.append(_(u"""
+            <li>
+             <label>
+              {_[Files]}
+              <small class="label-right"><a href='#Site+directory' id='link-directory' class='link-right'>{_[Open site directory]}</a>
+              <a href='/ZeroNet-Internal/Zip?address={site.address}' id='link-zip' class='link-right' download='site.zip'>{_[Save as .zip]}</a></small>
+             </label>
+             <ul class='graph graph-stacked'>
+        """))
 
         extensions = (
             ("html", "yellow"),
@@ -299,8 +340,10 @@ class UiWebsocketPlugin(object):
         i = 0
         for bad_file, tries in site.bad_files.iteritems():
             i += 1
-            body.append(_(u"""<li class='color-red' title="{bad_file} ({tries})">{bad_file}</li>""", {
-                "bad_file": cgi.escape(bad_file, True), "tries": _.pluralize(tries, "{} try", "{} tries")
+            body.append(_(u"""<li class='color-red' title="{bad_file_path} ({tries})">{bad_filename}</li>""", {
+                "bad_file_path": cgi.escape(bad_file, True),
+                "bad_filename": cgi.escape(helper.getFilename(bad_file), True),
+                "tries": _.pluralize(tries, "{} try", "{} tries")
             }))
             if i > 30:
                 break
@@ -378,13 +421,31 @@ class UiWebsocketPlugin(object):
             </li>
         """))
 
+        donate_key = site.content_manager.contents.get("content.json", {}).get("donate", True)
         site_address = self.site.address
         body.append(_(u"""
             <li>
              <label>{_[Site address]}</label><br>
              <div class='flex'>
               <span class='input text disabled'>{site_address}</span>
+        """))
+        if donate_key == False or donate_key == "":
+            pass
+        elif (type(donate_key) == str or type(donate_key) == unicode) and len(donate_key) > 0:
+            escaped_donate_key = cgi.escape(donate_key, True)
+            body.append(_(u"""
+             </div>
+            </li>
+            <li>
+             <label>{_[Donate]}</label><br>
+             <div class='flex'>
+             {escaped_donate_key}
+            """))
+        else:
+            body.append(_(u"""
               <a href='bitcoin:{site_address}' class='button' id='button-donate'>{_[Donate]}</a>
+            """))
+        body.append(_(u"""
              </div>
             </li>
         """))
@@ -421,9 +482,15 @@ class UiWebsocketPlugin(object):
         """))
 
     def sidebarRenderContents(self, body, site):
+        has_privatekey = bool(self.user.getSiteData(site.address).get("privatekey"))
+        if has_privatekey:
+            tag_privatekey = _(u"{_[Private key saved.]} <a href='#Forgot+private+key' id='privatekey-forgot' class='link-right'>{_[Forgot]}</a>")
+        else:
+            tag_privatekey = _(u"<a href='#Add+private+key' id='privatekey-add' class='link-right'>{_[Add saved private key]}</a>")
+
         body.append(_(u"""
             <li>
-             <label>{_[Content publishing]}</label>
+             <label>{_[Content publishing]} <small class='label-right'>{tag_privatekey}</small></label>
         """))
 
         # Choose content you want to sign
@@ -647,8 +714,22 @@ class UiWebsocketPlugin(object):
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
 
+        if self.site.address == config.updatesite:
+            return self.response(to, "You can't change the ownership of the updater site")
+
         self.site.settings["own"] = bool(owned)
         self.site.updateWebsocket(owned=owned)
+
+    def actionUserSetSitePrivatekey(self, to, privatekey):
+        permissions = self.getPermissions(to)
+        if "ADMIN" not in permissions:
+            return self.response(to, "You don't have permission to run this command")
+
+        site_data = self.user.sites[self.site.address]
+        site_data["privatekey"] = privatekey
+        self.site.updateWebsocket(set_privatekey=bool(privatekey))
+
+        return "ok"
 
     def actionSiteSetAutodownloadoptional(self, to, owned):
         permissions = self.getPermissions(to)
@@ -658,7 +739,7 @@ class UiWebsocketPlugin(object):
         self.site.settings["autodownloadoptional"] = bool(owned)
         self.site.bad_files = {}
         gevent.spawn(self.site.update, check_files=True)
-        self.site.worker_manager.removeGoodFileTasks()
+        self.site.worker_manager.removeSolvedFileTasks()
 
     def actionDbReload(self, to):
         permissions = self.getPermissions(to)

@@ -63,7 +63,7 @@ class FileRequest(object):
         # Don't allow other sites than locked
         if "site" in params and self.connection.target_onion:
             valid_sites = self.connection.getValidSites()
-            if params["site"] not in valid_sites:
+            if params["site"] not in valid_sites and valid_sites != ["global"]:
                 self.response({"error": "Invalid site"})
                 self.connection.log(
                     "Site lock violation: %s not in %s, target onion: %s" %
@@ -207,13 +207,14 @@ class FileRequest(object):
                 if file_size > read_bytes:  # Check if file is readable at current position (for big files)
                     if not self.isReadable(site, params["inner_path"], file, params["location"]):
                         raise RequestError("File not readable at position: %s" % params["location"])
+                else:
+                    if params.get("file_size") and params["file_size"] != file_size:
+                        self.connection.badAction(2)
+                        raise RequestError("File size does not match: %sB != %sB" % (params["file_size"], file_size))
 
                 if not streaming:
                     file.read_bytes = read_bytes
 
-                if params.get("file_size") and params["file_size"] != file_size:
-                    self.connection.badAction(2)
-                    raise RequestError("File size does not match: %sB != %sB" % (params["file_size"], file_size))
 
                 if params["location"] > file_size:
                     self.connection.badAction(5)
@@ -418,26 +419,6 @@ class FileRequest(object):
             peer.connect(self.connection)
         peer.hashfield.replaceFromString(params["hashfield_raw"])
         self.response({"ok": "Updated"})
-
-    def actionSiteReload(self, params):
-        if self.connection.ip not in config.ip_local and self.connection.ip != config.ip_external:
-            self.response({"error": "Only local host allowed"})
-
-        site = self.sites.get(params["site"])
-        site.content_manager.loadContent(params["inner_path"], add_bad_files=False)
-        site.storage.verifyFiles(quick_check=True)
-        site.updateWebsocket()
-
-        self.response({"ok": "Reloaded"})
-
-    def actionSitePublish(self, params):
-        if self.connection.ip not in config.ip_local and self.connection.ip != config.ip_external:
-            self.response({"error": "Only local host allowed"})
-
-        site = self.sites.get(params["site"])
-        num = site.publish(limit=8, inner_path=params.get("inner_path", "content.json"), diffs=params.get("diffs", {}))
-
-        self.response({"ok": "Successfuly published to %s peers" % num})
 
     # Send a simple Pong! answer
     def actionPing(self, params):

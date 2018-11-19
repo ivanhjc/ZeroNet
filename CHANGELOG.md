@@ -1,3 +1,83 @@
+## ZeroNet 0.6.4 (2018-10-20) Rev3660
+### Added
+ - New plugin: UiConfig. A web interface that allows changing ZeroNet settings.
+ - New plugin: AnnounceShare. Share trackers between users, automatically announce client's ip as tracker if Bootstrapper plugin is enabled.
+ - Global tracker stats on ZeroHello: Include statistics from all served sites instead of displaying request statistics only for one site.
+ - Support custom proxy for trackers. (Configurable with /Config)
+ - Adding peers to sites manually using zeronet_peers get parameter
+ - Copy site address with peers link on the sidebar.
+ - Zip file listing and streaming support for Bigfiles.
+ - Tracker statistics on /Stats page
+ - Peer reputation save/restore to speed up sync time after startup.
+ - Full support fileGet, fileList, dirList calls on tar.gz/zip files.
+ - Archived_before support to user content rules to allow deletion of all user files before the specified date
+ - Show and manage "Connecting" sites on ZeroHello
+ - Add theme support to ZeroNet sites
+ - Dark theme for ZeroHello, ZeroBlog, ZeroTalk
+
+### Changed
+ - Dynamic big file allocation: More efficient storage usage by don't pre-allocate the whole file at the beginning, but expand the size as the content downloads.
+ - Reduce the request frequency to unreliable trackers.
+ - Only allow 5 concurrent checkSites to run in parallel to reduce load under Tor/slow connection.
+ - Stop site downloading if it reached 95% of site limit to avoid download loop for sites out of limit
+ - The pinned optional files won't be removed from download queue after 30 retries and won't be deleted even if the site owner removes it.
+ - Don't remove incomplete (downloading) sites on startup
+ - Remove --pin_bigfile argument as big files are automatically excluded from optional files limit.
+
+### Fixed
+ - Trayicon compatibility with latest gevent
+ - Request number counting for zero:// trackers
+ - Peer reputation boost for zero:// trackers.
+ - Blocklist of peers loaded from peerdb (Thanks tangdou1 for report)
+ - Sidebar map loading on foreign languages (Thx tangdou1 for report)
+ - FileGet on non-existent files (Thanks mcdev for reporting)
+ - Peer connecting bug for sites with low amount of peers
+
+#### "The Vacation" Sandbox escape bug [Reported by GitCenter / Krixano / ZeroLSTN]
+
+In ZeroNet 0.6.3 Rev3615 and earlier as a result of invalid file type detection, a malicious site could escape the iframe sandbox.
+
+Result: Browser iframe sandbox escape
+
+Applied fix: Replaced the previous, file extension based file type identification with a proper one.
+
+Affected versions: All versions before ZeroNet Rev3616
+
+
+## ZeroNet 0.6.3 (2018-06-26)
+### Added
+ - New plugin: ContentFilter that allows to have shared site and user block list.
+ - Support Tor meek proxies to avoid tracker blocking of GFW
+ - Detect network level tracker blocking and easy setting meek proxy for tracker connections.
+ - Support downloading 2GB+ sites as .zip (Thx to Radtoo)
+ - Support ZeroNet as a transparent proxy (Thx to JeremyRand)
+ - Allow fileQuery as CORS command (Thx to imachug)
+ - Windows distribution includes Tor and meek client by default
+ - Download sites as zip link to sidebar
+ - File server port randomization
+ - Implicit SSL for all connection
+ - fileList API command for zip files
+ - Auto download bigfiles size limit on sidebar
+ - Local peer number to the sidebar
+ - Open site directory button in sidebar
+
+### Changed
+ - Switched to Azure Tor meek proxy as Amazon one became unavailable
+ - Refactored/rewritten tracker connection manager
+ - Improved peer discovery for optional files without opened port
+ - Also delete Bigfile's piecemap on deletion
+
+### Fixed
+ - Important security issue: Iframe sandbox escape [Reported by Ivanq / gitcenter]
+ - Local peer discovery when running multiple clients on the same machine
+ - Uploading small files with Bigfile plugin
+ - Ctrl-c shutdown when running CLI commands
+ - High CPU/IO usage when Multiuser plugin enabled
+ - Firefox back button
+ - Peer discovery on older Linux kernels
+ - Optional file handling when multiple files have the same hash_id (first 4 chars of the hash)
+ - Msgpack 0.5.5 and 0.5.6 compatibility
+
 ## ZeroNet 0.6.2 (2018-02-18)
 
 ### Added

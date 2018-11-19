@@ -27,21 +27,16 @@ class ConnectionServer(object):
         self.port_opened = None
         self.peer_blacklist = SiteManager.peer_blacklist
 
-        if config.tor != "disabled":
-            self.tor_manager = TorManager(self.ip, self.port)
-        else:
-            self.tor_manager = None
-
+        self.tor_manager = TorManager(self.ip, self.port)
         self.connections = []  # Connections
         self.whitelist = config.ip_local  # No flood protection on this ips
         self.ip_incoming = {}  # Incoming connections from ip in the last minute to avoid connection flood
-        self.broken_ssl_peer_ids = {}  # Peerids of broken ssl connections
+        self.broken_ssl_ips = {}  # Peerids of broken ssl connections
         self.ips = {}  # Connection by ip
         self.has_internet = True  # Internet outage detection
 
         self.stream_server = None
-        self.running = True
-        self.thread_checker = gevent.spawn(self.checkConnections)
+        self.running = False
 
         self.stat_recv = defaultdict(lambda: defaultdict(int))
         self.stat_sent = defaultdict(lambda: defaultdict(int))
@@ -50,8 +45,13 @@ class ConnectionServer(object):
         self.num_recv = 0
         self.num_sent = 0
 
+        self.num_incoming = 0
+        self.num_outgoing = 0
+
+        self.timecorrection = 0.0
+
         # Bittorrent style peerid
-        self.peer_id = "-ZN0%s-%s" % (config.version.replace(".", ""), CryptHash.random(12, "base64"))
+        self.peer_id = "-UT3530-%s" % CryptHash.random(12, "base64")
 
         # Check msgpack version
         if msgpack.version[0] == 0 and msgpack.version[1] < 4:
@@ -61,33 +61,47 @@ class ConnectionServer(object):
             )
             sys.exit(0)
 
-        if port:  # Listen server on a port
-            self.pool = Pool(500)  # do not accept more than 500 connections
-            self.stream_server = StreamServer(
-                (ip.replace("*", "0.0.0.0"), port), self.handleIncomingConnection, spawn=self.pool, backlog=100
-            )
-            if request_handler:
-                self.handleRequest = request_handler
+        if request_handler:
+            self.handleRequest = request_handler
 
-    def start(self):
+    def start(self, check_connections=True):
         self.running = True
+        if check_connections:
+            self.thread_checker = gevent.spawn(self.checkConnections)
         CryptConnection.manager.loadCerts()
+        if config.tor != "disable":
+            self.tor_manager.start()
+        if not self.port:
+            self.log.info("No port found, not binding")
+            return False
+
         self.log.debug("Binding to: %s:%s, (msgpack: %s), supported crypt: %s" % (
             self.ip, self.port,
             ".".join(map(str, msgpack.version)), CryptConnection.manager.crypt_supported)
         )
         try:
-            self.stream_server.serve_forever()  # Start normal connection server
+            self.pool = Pool(500)  # do not accept more than 500 connections
+            self.stream_server = StreamServer(
+                (self.ip, self.port), self.handleIncomingConnection, spawn=self.pool, backlog=100
+            )
         except Exception, err:
-            self.log.info("StreamServer bind error, must be running already: %s" % err)
+            self.log.info("StreamServer bind error: %s" % err)
+
+    def listen(self):
+        try:
+            self.stream_server.serve_forever()
+        except Exception, err:
+            self.log.info("StreamServer listen error: %s" % err)
 
     def stop(self):
+        self.log.debug("Stopping")
         self.running = False
         if self.stream_server:
             self.stream_server.stop()
 
     def handleIncomingConnection(self, sock, addr):
         ip, port = addr
+        self.num_incoming += 1
 
         # Connection flood protection
         if ip in self.ip_incoming and ip not in self.whitelist:
@@ -109,9 +123,12 @@ class ConnectionServer(object):
     def handleMessage(self, *args, **kwargs):
         pass
 
-    def getConnection(self, ip=None, port=None, peer_id=None, create=True, site=None):
-        if ip.endswith(".onion") and self.tor_manager.start_onions and site:  # Site-unique connection for Tor
-            site_onion = self.tor_manager.getOnion(site.address)
+    def getConnection(self, ip=None, port=None, peer_id=None, create=True, site=None, is_tracker_connection=False):
+        if (ip.endswith(".onion") or self.port_opened == False) and self.tor_manager.start_onions and site:  # Site-unique connection for Tor
+            if ip.endswith(".onion"):
+                site_onion = self.tor_manager.getOnion(site.address)
+            else:
+                site_onion = self.tor_manager.getOnion("global")
             key = ip + site_onion
         else:
             key = ip
@@ -145,16 +162,18 @@ class ConnectionServer(object):
             if port == 0:
                 raise Exception("This peer is not connectable")
 
-            if (ip, port) in self.peer_blacklist:
+            if (ip, port) in self.peer_blacklist and not is_tracker_connection:
                 raise Exception("This peer is blacklisted")
 
             try:
-                if ip.endswith(".onion") and self.tor_manager.start_onions and site:  # Lock connection to site
-                    connection = Connection(self, ip, port, target_onion=site_onion)
+                if (ip.endswith(".onion") or self.port_opened == False) and self.tor_manager.start_onions and site:  # Lock connection to site
+                    connection = Connection(self, ip, port, target_onion=site_onion, is_tracker_connection=is_tracker_connection)
                 else:
-                    connection = Connection(self, ip, port)
+                    connection = Connection(self, ip, port, is_tracker_connection=is_tracker_connection)
+                self.num_outgoing += 1
                 self.ips[key] = connection
                 self.connections.append(connection)
+                connection.log("Connecting... (site: %s)" % site)
                 succ = connection.connect()
                 if not succ:
                     connection.close("Connection event return error")
@@ -192,11 +211,11 @@ class ConnectionServer(object):
             run_i += 1
             time.sleep(15)  # Check every minute
             self.ip_incoming = {}  # Reset connected ips counter
-            self.broken_ssl_peer_ids = {}  # Reset broken ssl peerids count
+            self.broken_ssl_ips = {}  # Reset broken ssl peerids count
             last_message_time = 0
             s = time.time()
             for connection in self.connections[:]:  # Make a copy
-                if connection.ip.endswith(".onion"):
+                if connection.ip.endswith(".onion") or config.tor == "always":
                     timeout_multipler = 2
                 else:
                     timeout_multipler = 1
@@ -212,11 +231,11 @@ class ConnectionServer(object):
                     connection.unpacker = None
 
                 elif connection.last_cmd_sent == "announce" and idle > 20:  # Bootstrapper connection close after 20 sec
-                    connection.close("[Cleanup] Tracker connection: %s" % idle)
+                    connection.close("[Cleanup] Tracker connection, idle: %.3fs" % idle)
 
                 if idle > 60 * 60:
                     # Wake up after 1h
-                    connection.close("[Cleanup] After wakeup, idle: %s" % idle)
+                    connection.close("[Cleanup] After wakeup, idle: %.3fs" % idle)
 
                 elif idle > 20 * 60 and connection.last_send_time < time.time() - 10:
                     # Idle more than 20 min and we have not sent request in last 10 sec
@@ -255,7 +274,7 @@ class ConnectionServer(object):
             # Internet outage detection
             if time.time() - last_message_time > max(60, 60 * 10 / max(1, float(len(self.connections)) / 50)):
                 # Offline: Last message more than 60-600sec depending on connection number
-                if self.has_internet:
+                if self.has_internet and last_message_time:
                     self.has_internet = False
                     self.onInternetOffline()
             else:
@@ -264,8 +283,11 @@ class ConnectionServer(object):
                     self.has_internet = True
                     self.onInternetOnline()
 
+            self.timecorrection = self.getTimecorrection()
+
             if time.time() - s > 0.01:
                 self.log.debug("Connection cleanup in %.3fs" % (time.time() - s))
+        self.log.debug("Checkconnections ended")
 
     @util.Noparallel(blocking=False)
     def checkMaxConnections(self):
@@ -294,3 +316,15 @@ class ConnectionServer(object):
 
     def onInternetOffline(self):
         self.log.info("Internet offline")
+
+    def getTimecorrection(self):
+        corrections = sorted([
+            connection.handshake.get("time") - connection.handshake_time + connection.last_ping_delay
+            for connection in self.connections
+            if connection.handshake.get("time") and connection.last_ping_delay
+        ])
+        if len(corrections) < 6:
+            return 0.0
+        mid = len(corrections) / 2 - 1
+        median = (corrections[mid - 1] + corrections[mid] + corrections[mid + 1]) / 3
+        return median

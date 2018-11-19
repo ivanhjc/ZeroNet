@@ -59,6 +59,7 @@ class WorkerManager(object):
                             worker.skip()
                     else:
                         self.failTask(task)
+
                 elif time.time() >= task["time_added"] + 60 and not self.workers:  # No workers left
                     self.log.debug("Timeout, Cleanup task: %s" % task)
                     # Remove task
@@ -119,12 +120,12 @@ class WorkerManager(object):
                 continue  # No peers found yet for the optional task
             return task
 
-    def removeGoodFileTasks(self):
+    def removeSolvedFileTasks(self, mark_as_good=True):
         for task in self.tasks[:]:
             if task["inner_path"] not in self.site.bad_files:
-                self.log.debug("No longer in bad_files, marking as good: %s" % task["inner_path"])
+                self.log.debug("No longer in bad_files, marking as %s: %s" % (mark_as_good, task["inner_path"]))
                 task["done"] = True
-                task["evt"].set(True)
+                task["evt"].set(mark_as_good)
                 self.tasks.remove(task)
         if not self.tasks:
             self.started_task_num = 0
@@ -420,7 +421,6 @@ class WorkerManager(object):
                 self.log.debug("Starting new workers... (tasks: %s)" % len(self.tasks))
                 self.startWorkers()
 
-
     # Tasks sorted by this
     def getPriorityBoost(self, inner_path):
         if inner_path == "content.json":
@@ -518,7 +518,7 @@ class WorkerManager(object):
     def checkComplete(self):
         time.sleep(0.1)
         if not self.tasks:
-            self.log.debug("Check compelte: No tasks")
+            self.log.debug("Check complete: No tasks")
             self.onComplete()
 
     def onComplete(self):
